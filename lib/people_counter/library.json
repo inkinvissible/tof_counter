@@ -1,0 +1,6 @@
+{
+    "name": "people_counter",
+    "version": "1.0.0",
+    "description": "Nucleo puro del contador de personas (testeable en native, sin Arduino).",
+    "frameworks": "*"
+}

@@ -3,6 +3,24 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#include "PeopleCounter.h"
+
+// ============================================================
+// main.cpp — capa de hardware y simulación.
+//
+// Responsabilidades:
+//   - inicializar ESP32 / OLED / Serial
+//   - generar/simular los frames ToF
+//   - pasar cada frame a PeopleCounter
+//   - leer los resultados (contadores + eventos)
+//   - actualizar OLED y logs Serial
+//
+// Toda la lógica del algoritmo vive en PeopleCounter
+// (lib/people_counter), que es C++ puro y testeable en native.
+// ============================================================
+
+static constexpr int MATRIX_SIZE = PeopleCounter::MATRIX_SIZE;
+
 // ============================================================
 // OLED
 // ============================================================
@@ -20,51 +38,19 @@ Adafruit_SSD1306 display(
 );
 
 // ============================================================
-// MATRIZ ToF SIMULADA
+// ESTADO
 // ============================================================
 
-#define MATRIX_SIZE 8
+PeopleCounter counter;
 
-// Sensor a 2.5 metros del piso
-const uint16_t FLOOR_DISTANCE_MM = 2500;
-
-// Si algo está al menos 500 mm por encima del piso,
-// lo consideramos foreground.
-const uint16_t HEIGHT_THRESHOLD_MM = 500;
-
-// Matriz de profundidad actual
 uint16_t depthMatrix[MATRIX_SIZE][MATRIX_SIZE];
-
-// Máscara binaria de ocupación
-bool occupied[MATRIX_SIZE][MATRIX_SIZE];
-
-// ============================================================
-// CONTADORES
-// ============================================================
-
-int peopleInside = 0;
-int totalIn = 0;
-int totalOut = 0;
-
-// ============================================================
-// TRACKING
-// ============================================================
-
-float previousCentroidY = -1;
-float currentCentroidY = -1;
-
-// Línea virtual que divide exterior/interior
-const float CROSSING_LINE_Y = 3.5;
-
-// Para evitar contar dos veces la misma persona
-bool alreadyCounted = false;
 
 // ============================================================
 // SIMULACIÓN
 // ============================================================
 
-// Fila superior del blob de la persona
-int simulatedPersonY = -2;
+int personAY = -2;
+int personDirection = 1;
 
 unsigned long lastFrameTime = 0;
 const unsigned long FRAME_INTERVAL = 700;
@@ -73,75 +59,97 @@ const unsigned long FRAME_INTERVAL = 700;
 // OLED
 // ============================================================
 
-void updateDisplay(const char *lastEvent = "-") {
+void updateDisplay(int detected = 0) {
+
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.println("PEOPLE COUNTER");
+    display.println("TOF PEOPLE COUNTER");
 
-    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+    display.drawLine(
+        0,
+        10,
+        127,
+        10,
+        SSD1306_WHITE
+    );
 
     display.setTextSize(2);
     display.setCursor(0, 16);
-    display.print("Inside:");
-    display.println(peopleInside);
+
+    display.print("Seen:");
+    display.println(detected);
 
     display.setTextSize(1);
 
-    display.setCursor(0, 42);
+    display.setCursor(0, 43);
     display.print("IN:");
-    display.print(totalIn);
+    display.print(counter.getTotalIn());
 
-    display.setCursor(55, 42);
+    display.setCursor(55, 43);
     display.print("OUT:");
-    display.print(totalOut);
+    display.print(counter.getTotalOut());
 
-    display.setCursor(0, 54);
-    display.print("Last: ");
-    display.print(lastEvent);
+    display.setCursor(0, 55);
+    display.print("Inside:");
+    display.print(counter.getPeopleInside());
 
     display.display();
 }
 
 // ============================================================
-// GENERAR FRAME VACÍO
+// SIMULACIÓN DE MATRIZ ToF
 // ============================================================
 
 void clearDepthMatrix() {
+
     for (int y = 0; y < MATRIX_SIZE; y++) {
+
         for (int x = 0; x < MATRIX_SIZE; x++) {
 
-            // Pequeña variación para que parezca una medición real
             int noise = random(-10, 11);
 
             depthMatrix[y][x] =
-                FLOOR_DISTANCE_MM + noise;
+                PeopleCounter::FLOOR_DISTANCE_MM + noise;
         }
     }
 }
 
 // ============================================================
-// SIMULAR PERSONA
+// AGREGAR UNA PERSONA SIMULADA
 // ============================================================
 
-void addSimulatedPerson() {
+void addPersonBlob(
+    int startX,
+    int startY
+) {
 
-    // Persona representada como un blob 2×2
-    // centrado aproximadamente en X = 3.5
+    // Persona = blob 2x2
 
     for (int dy = 0; dy < 2; dy++) {
 
-        int y = simulatedPersonY + dy;
+        int y = startY + dy;
 
-        if (y < 0 || y >= MATRIX_SIZE) {
+        if (
+            y < 0 ||
+            y >= MATRIX_SIZE
+        ) {
             continue;
         }
 
-        for (int x = 3; x <= 4; x++) {
+        for (int dx = 0; dx < 2; dx++) {
 
-            // La cabeza/cuerpo está a aprox. 900 mm del sensor
+            int x = startX + dx;
+
+            if (
+                x < 0 ||
+                x >= MATRIX_SIZE
+            ) {
+                continue;
+            }
+
             depthMatrix[y][x] =
                 900 + random(-30, 31);
         }
@@ -149,26 +157,23 @@ void addSimulatedPerson() {
 }
 
 // ============================================================
-// CONVERTIR PROFUNDIDAD → FOREGROUND
+// GENERAR ESCENARIO
 // ============================================================
 
-void calculateForegroundMask() {
+void generateScenario() {
 
-    for (int y = 0; y < MATRIX_SIZE; y++) {
+    clearDepthMatrix();
 
-        for (int x = 0; x < MATRIX_SIZE; x++) {
-
-            int height =
-                FLOOR_DISTANCE_MM - depthMatrix[y][x];
-
-            occupied[y][x] =
-                height > HEIGHT_THRESHOLD_MM;
-        }
-    }
+    // Persona se acerca por el exterior
+    addPersonBlob(
+        3,
+        personAY
+    );
 }
 
 // ============================================================
-// MOSTRAR MATRIZ
+// VISUALIZACIÓN (solo para Serial; el algoritmo usa su
+// propia máscara interna dentro de PeopleCounter)
 // ============================================================
 
 void printOccupancyMatrix() {
@@ -180,16 +185,21 @@ void printOccupancyMatrix() {
 
         for (int x = 0; x < MATRIX_SIZE; x++) {
 
-            if (occupied[y][x]) {
-                Serial.print("#");
-            } else {
-                Serial.print(".");
-            }
+            int height =
+                static_cast<int>(PeopleCounter::FLOOR_DISTANCE_MM) -
+                static_cast<int>(depthMatrix[y][x]);
+
+            bool fg =
+                height >
+                static_cast<int>(PeopleCounter::HEIGHT_THRESHOLD_MM);
+
+            Serial.print(fg ? "#" : ".");
         }
 
-        // Dibujamos visualmente la línea virtual
         if (y == 3) {
-            Serial.print("   <-- LINEA");
+            Serial.print(
+                "   <-- LINEA VIRTUAL"
+            );
         }
 
         Serial.println();
@@ -197,97 +207,141 @@ void printOccupancyMatrix() {
 }
 
 // ============================================================
-// CALCULAR CENTROIDE
+// IMPRIMIR BLOBS (lee el estado de PeopleCounter)
 // ============================================================
 
-bool calculateCentroid(float &centroidX, float &centroidY) {
+void printBlobs() {
 
-    int count = 0;
-    float sumX = 0;
-    float sumY = 0;
+    Serial.println();
 
-    for (int y = 0; y < MATRIX_SIZE; y++) {
+    Serial.print(
+        "Blobs detectados: "
+    );
 
-        for (int x = 0; x < MATRIX_SIZE; x++) {
+    Serial.println(counter.getDetectedBlobCount());
 
-            if (occupied[y][x]) {
+    for (
+        int i = 0;
+        i < counter.getDetectedBlobCount();
+        i++
+    ) {
+        PeopleCounter::BlobInfo blob = counter.getBlob(i);
 
-                sumX += x;
-                sumY += y;
+        Serial.print("Blob #");
+        Serial.println(i + 1);
 
-                count++;
-            }
-        }
+        Serial.print("  Pixels: ");
+        Serial.println(blob.pixelCount);
+
+        Serial.print("  Centroide: X=");
+        Serial.print(blob.centroidX, 2);
+
+        Serial.print(" Y=");
+        Serial.println(blob.centroidY, 2);
     }
-
-    if (count == 0) {
-        return false;
-    }
-
-    centroidX = sumX / count;
-    centroidY = sumY / count;
-
-    return true;
 }
 
-// ============================================================
-// DETECTAR CRUCE
-// ============================================================
+void printTracks() {
 
-void detectCrossing(float centroidY) {
+    Serial.println();
+    Serial.println("Tracks activos:");
 
-    currentCentroidY = centroidY;
+    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
 
-    if (
-        previousCentroidY >= 0 &&
-        !alreadyCounted
-    ) {
+        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
 
-        // Exterior → Interior
-        if (
-            previousCentroidY < CROSSING_LINE_Y &&
-            currentCentroidY >= CROSSING_LINE_Y
-        ) {
-
-            totalIn++;
-            peopleInside++;
-
-            alreadyCounted = true;
-
-            Serial.println();
-            Serial.println(">>> PERSONA ENTRANDO <<<");
-
-            Serial.print("Personas dentro: ");
-            Serial.println(peopleInside);
-
-            updateDisplay("IN");
+        if (!track.active) {
+            continue;
         }
 
-        // Interior → Exterior
-        else if (
-            previousCentroidY > CROSSING_LINE_Y &&
-            currentCentroidY <= CROSSING_LINE_Y
-        ) {
+        Serial.print("  Track #");
+        Serial.print(track.id);
 
-            totalOut++;
+        Serial.print(" -> X=");
+        Serial.print(track.x, 2);
 
-            if (peopleInside > 0) {
-                peopleInside--;
+        Serial.print(" Y=");
+        Serial.print(track.y, 2);
+
+        Serial.print(" counted=");
+        Serial.println(
+            track.alreadyCounted
+                ? "YES"
+                : "NO"
+        );
+    }
+}
+
+// Informa creaciones/bajas de tracks comparando los IDs
+// activos antes y después del frame. Replica los mensajes
+// "NUEVO TRACK" / "FINALIZADO" que antes imprimía la lógica
+// de tracking, sin que PeopleCounter dependa de Serial.
+void printTrackLifecycle(
+    const int idsBefore[PeopleCounter::MAX_TRACKS],
+    int countBefore
+) {
+    // Altas
+    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
+        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
+
+        if (!track.active) {
+            continue;
+        }
+
+        bool known = false;
+        for (int j = 0; j < countBefore; j++) {
+            if (idsBefore[j] == track.id) {
+                known = true;
+                break;
             }
+        }
 
-            alreadyCounted = true;
-
-            Serial.println();
-            Serial.println(">>> PERSONA SALIENDO <<<");
-
-            Serial.print("Personas dentro: ");
-            Serial.println(peopleInside);
-
-            updateDisplay("OUT");
+        if (!known) {
+            Serial.print("NUEVO TRACK #");
+            Serial.println(track.id);
         }
     }
 
-    previousCentroidY = currentCentroidY;
+    // Bajas
+    for (int j = 0; j < countBefore; j++) {
+        bool stillActive = false;
+        for (int i = 0; i < counter.getTrackSlotCount(); i++) {
+            PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
+            if (track.active && track.id == idsBefore[j]) {
+                stillActive = true;
+                break;
+            }
+        }
+
+        if (!stillActive) {
+            Serial.print("TRACK #");
+            Serial.print(idsBefore[j]);
+            Serial.println(" FINALIZADO");
+        }
+    }
+}
+
+void printCrossingEvents() {
+    for (int i = 0; i < counter.getLastEventCount(); i++) {
+        PeopleCounter::CrossingEvent event = counter.getLastEvent(i);
+
+        Serial.println();
+        Serial.print(">>> TRACK #");
+        Serial.print(event.trackId);
+
+        if (event.direction == PeopleCounter::CrossingDirection::In) {
+            Serial.println(" ENTRO <<<");
+        } else if (
+            event.direction == PeopleCounter::CrossingDirection::Out
+        ) {
+            Serial.println(" SALIO <<<");
+        } else {
+            continue;
+        }
+
+        Serial.print("Inside: ");
+        Serial.println(counter.getPeopleInside());
+    }
 }
 
 // ============================================================
@@ -296,36 +350,30 @@ void detectCrossing(float centroidY) {
 
 void processFrame() {
 
-    clearDepthMatrix();
+    generateScenario();
 
-    addSimulatedPerson();
+    // Snapshot de tracks activos para el log de altas/bajas.
+    int idsBefore[PeopleCounter::MAX_TRACKS];
+    int countBefore = 0;
+    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
+        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
+        if (track.active) {
+            idsBefore[countBefore++] = track.id;
+        }
+    }
 
-    calculateForegroundMask();
+    counter.processFrame(depthMatrix);
 
     printOccupancyMatrix();
 
-    float centroidX;
-    float centroidY;
+    printBlobs();
 
-    bool personDetected =
-        calculateCentroid(centroidX, centroidY);
+    printTrackLifecycle(idsBefore, countBefore);
+    printCrossingEvents();
 
-    if (personDetected) {
+    printTracks();
 
-        Serial.print("Centroide: X=");
-        Serial.print(centroidX, 2);
-
-        Serial.print(" Y=");
-        Serial.println(centroidY, 2);
-
-        detectCrossing(centroidY);
-
-    } else {
-
-        Serial.println("Sin persona detectada");
-
-        previousCentroidY = -1;
-    }
+    updateDisplay(counter.getDetectedBlobCount());
 }
 
 // ============================================================
@@ -336,24 +384,39 @@ void setup() {
 
     Serial.begin(115200);
 
-    Wire.begin(21, 22);
+    Wire.begin(
+        21,
+        22
+    );
 
     delay(500);
 
-    randomSeed(analogRead(0));
+    randomSeed(
+        analogRead(0)
+    );
 
     Serial.println();
-    Serial.println("==============================");
-    Serial.println(" PEOPLE COUNTER - ToF 8x8");
-    Serial.println("==============================");
+    Serial.println(
+        "================================"
+    );
 
-    if (!display.begin(
-        SSD1306_SWITCHCAPVCC,
-        OLED_ADDRESS
-    )) {
+    Serial.println(
+        " PEOPLE COUNTER - MULTI BLOB"
+    );
+
+    Serial.println(
+        "================================"
+    );
+
+    if (
+        !display.begin(
+            SSD1306_SWITCHCAPVCC,
+            OLED_ADDRESS
+        )
+    ) {
 
         Serial.println(
-            "ERROR: No se pudo iniciar OLED"
+            "ERROR OLED"
         );
 
         while (true) {
@@ -361,15 +424,10 @@ void setup() {
         }
     }
 
-    Serial.println(
-        "OLED inicializada correctamente"
-    );
-
     updateDisplay();
 
-    Serial.println();
     Serial.println(
-        "Iniciando simulacion..."
+        "Sistema iniciado"
     );
 }
 
@@ -380,36 +438,45 @@ void setup() {
 void loop() {
 
     if (
-        millis() - lastFrameTime >= FRAME_INTERVAL
+        millis() -
+        lastFrameTime >=
+        FRAME_INTERVAL
     ) {
 
-        lastFrameTime = millis();
+        lastFrameTime =
+            millis();
 
         processFrame();
 
-        // Mover persona hacia el interior
-        simulatedPersonY++;
+        personAY += personDirection;
 
-        // Terminó de atravesar la matriz
-        if (simulatedPersonY > MATRIX_SIZE) {
+        // Llegó cerca de la línea, pero NO la cruza.
+        // Se arrepiente y vuelve.
+        if (personAY >= 2) {
+            personDirection = -1;
+        }
+
+        // Cuando vuelve a desaparecer por arriba:
+        if (personAY < -2) {
 
             Serial.println();
             Serial.println(
-                "=== FIN DEL RECORRIDO ==="
+                "===== FIN ESCENARIO SIN CRUCE ====="
             );
 
-            Serial.println(
-                "Reiniciando en 3 segundos..."
-            );
+            Serial.print("IN total: ");
+            Serial.println(counter.getTotalIn());
+
+            Serial.print("OUT total: ");
+            Serial.println(counter.getTotalOut());
+
+            Serial.print("Inside: ");
+            Serial.println(counter.getPeopleInside());
 
             delay(3000);
 
-            simulatedPersonY = -2;
-
-            previousCentroidY = -1;
-            currentCentroidY = -1;
-
-            alreadyCounted = false;
+            personAY = -2;
+            personDirection = 1;
         }
     }
 }
