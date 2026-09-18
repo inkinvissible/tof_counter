@@ -1,482 +1,353 @@
-#include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_VL53L0X.h>
 
-#include "PeopleCounter.h"
+// ==============================
+// PINES
+// ==============================
 
-// ============================================================
-// main.cpp — capa de hardware y simulación.
-//
-// Responsabilidades:
-//   - inicializar ESP32 / OLED / Serial
-//   - generar/simular los frames ToF
-//   - pasar cada frame a PeopleCounter
-//   - leer los resultados (contadores + eventos)
-//   - actualizar OLED y logs Serial
-//
-// Toda la lógica del algoritmo vive en PeopleCounter
-// (lib/people_counter), que es C++ puro y testeable en native.
-// ============================================================
+#define SDA_PIN 21
+#define SCL_PIN 22
 
-static constexpr int MATRIX_SIZE = PeopleCounter::MATRIX_SIZE;
+#define XSHUT_A 25
+#define XSHUT_B 26
 
-// ============================================================
-// OLED
-// ============================================================
+// Direcciones I2C nuevas
+#define ADDRESS_A 0x30
+#define ADDRESS_B 0x31
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-#define OLED_ADDRESS 0x3C
+// ==============================
+// CONFIGURACIÓN
+// ==============================
 
-Adafruit_SSD1306 display(
-    SCREEN_WIDTH,
-    SCREEN_HEIGHT,
-    &Wire,
-    OLED_RESET
-);
+// Persona detectada si está más cerca que esto
+const uint16_t DETECT_MM = 1300;
 
-// ============================================================
-// ESTADO
-// ============================================================
+// Se considera nuevamente libre por encima de esto.
+// La diferencia evita parpadeos cerca del límite.
+const uint16_t RELEASE_MM = 1500;
 
-PeopleCounter counter;
+// Tiempo máximo entre sensor A y sensor B
+const unsigned long MAX_CROSS_TIME = 1500;
 
-uint16_t depthMatrix[MATRIX_SIZE][MATRIX_SIZE];
+// ==============================
+// SENSORES
+// ==============================
 
-// ============================================================
-// SIMULACIÓN
-// ============================================================
+Adafruit_VL53L0X sensorA = Adafruit_VL53L0X();
+Adafruit_VL53L0X sensorB = Adafruit_VL53L0X();
 
-int personAY = -2;
-int personDirection = 1;
+// ==============================
+// VARIABLES
+// ==============================
 
-unsigned long lastFrameTime = 0;
-const unsigned long FRAME_INTERVAL = 700;
+bool presenceA = false;
+bool presenceB = false;
 
-// ============================================================
-// OLED
-// ============================================================
+bool previousA = false;
+bool previousB = false;
 
-void updateDisplay(int detected = 0) {
+unsigned long sequenceStart = 0;
 
-    display.clearDisplay();
-    display.setTextColor(SSD1306_WHITE);
+unsigned long entradas = 0;
+unsigned long salidas = 0;
 
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("TOF PEOPLE COUNTER");
+enum State {
+  IDLE,
+  A_FIRST,
+  B_FIRST,
+  WAIT_CLEAR
+};
 
-    display.drawLine(
-        0,
-        10,
-        127,
-        10,
-        SSD1306_WHITE
-    );
+State state = IDLE;
 
-    display.setTextSize(2);
-    display.setCursor(0, 16);
 
-    display.print("Seen:");
-    display.println(detected);
+// ==============================
+// INICIALIZAR LOS DOS VL53L0X
+// ==============================
 
-    display.setTextSize(1);
+void initSensors() {
 
-    display.setCursor(0, 43);
-    display.print("IN:");
-    display.print(counter.getTotalIn());
+  // Apagamos ambos sensores
+  digitalWrite(XSHUT_A, LOW);
+  digitalWrite(XSHUT_B, LOW);
 
-    display.setCursor(55, 43);
-    display.print("OUT:");
-    display.print(counter.getTotalOut());
+  delay(20);
 
-    display.setCursor(0, 55);
-    display.print("Inside:");
-    display.print(counter.getPeopleInside());
+  // --------------------------
+  // SENSOR A
+  // --------------------------
 
-    display.display();
-}
+  digitalWrite(XSHUT_A, HIGH);
+  delay(20);
 
-// ============================================================
-// SIMULACIÓN DE MATRIZ ToF
-// ============================================================
-
-void clearDepthMatrix() {
-
-    for (int y = 0; y < MATRIX_SIZE; y++) {
-
-        for (int x = 0; x < MATRIX_SIZE; x++) {
-
-            int noise = random(-10, 11);
-
-            depthMatrix[y][x] =
-                PeopleCounter::FLOOR_DISTANCE_MM + noise;
-        }
+  if (!sensorA.begin(ADDRESS_A)) {
+    Serial.println("ERROR: no se encontró SENSOR A");
+    while (1) {
+      delay(10);
     }
-}
+  }
 
-// ============================================================
-// AGREGAR UNA PERSONA SIMULADA
-// ============================================================
+  // --------------------------
+  // SENSOR B
+  // --------------------------
 
-void addPersonBlob(
-    int startX,
-    int startY
-) {
+  digitalWrite(XSHUT_B, HIGH);
+  delay(20);
 
-    // Persona = blob 2x2
-
-    for (int dy = 0; dy < 2; dy++) {
-
-        int y = startY + dy;
-
-        if (
-            y < 0 ||
-            y >= MATRIX_SIZE
-        ) {
-            continue;
-        }
-
-        for (int dx = 0; dx < 2; dx++) {
-
-            int x = startX + dx;
-
-            if (
-                x < 0 ||
-                x >= MATRIX_SIZE
-            ) {
-                continue;
-            }
-
-            depthMatrix[y][x] =
-                900 + random(-30, 31);
-        }
+  if (!sensorB.begin(ADDRESS_B)) {
+    Serial.println("ERROR: no se encontró SENSOR B");
+    while (1) {
+      delay(10);
     }
+  }
+
+  Serial.println("Sensores inicializados correctamente.");
 }
 
-// ============================================================
-// GENERAR ESCENARIO
-// ============================================================
 
-void generateScenario() {
+// ==============================
+// LEER DISTANCIA
+// ==============================
 
-    clearDepthMatrix();
+uint16_t readDistance(Adafruit_VL53L0X &sensor) {
 
-    // Persona se acerca por el exterior
-    addPersonBlob(
-        3,
-        personAY
-    );
+  VL53L0X_RangingMeasurementData_t measure;
+
+  sensor.rangingTest(&measure, false);
+
+  if (measure.RangeStatus != 4) {
+    return measure.RangeMilliMeter;
+  }
+
+  // 8190 = lectura inválida/fuera de rango
+  return 8190;
 }
 
-// ============================================================
-// VISUALIZACIÓN (solo para Serial; el algoritmo usa su
-// propia máscara interna dentro de PeopleCounter)
-// ============================================================
 
-void printOccupancyMatrix() {
+// ==============================
+// DETECTAR PRESENCIA
+// CON HISTÉRESIS
+// ==============================
 
-    Serial.println();
-    Serial.println("-------- FRAME --------");
+bool updatePresence(uint16_t distance, bool currentPresence) {
 
-    for (int y = 0; y < MATRIX_SIZE; y++) {
+  // Si la lectura fue inválida, mantenemos el estado anterior.
+  if (distance == 8190) {
+    return currentPresence;
+  }
 
-        for (int x = 0; x < MATRIX_SIZE; x++) {
+  if (!currentPresence) {
 
-            int height =
-                static_cast<int>(PeopleCounter::FLOOR_DISTANCE_MM) -
-                static_cast<int>(depthMatrix[y][x]);
-
-            bool fg =
-                height >
-                static_cast<int>(PeopleCounter::HEIGHT_THRESHOLD_MM);
-
-            Serial.print(fg ? "#" : ".");
-        }
-
-        if (y == 3) {
-            Serial.print(
-                "   <-- LINEA VIRTUAL"
-            );
-        }
-
-        Serial.println();
-    }
-}
-
-// ============================================================
-// IMPRIMIR BLOBS (lee el estado de PeopleCounter)
-// ============================================================
-
-void printBlobs() {
-
-    Serial.println();
-
-    Serial.print(
-        "Blobs detectados: "
-    );
-
-    Serial.println(counter.getDetectedBlobCount());
-
-    for (
-        int i = 0;
-        i < counter.getDetectedBlobCount();
-        i++
-    ) {
-        PeopleCounter::BlobInfo blob = counter.getBlob(i);
-
-        Serial.print("Blob #");
-        Serial.println(i + 1);
-
-        Serial.print("  Pixels: ");
-        Serial.println(blob.pixelCount);
-
-        Serial.print("  Centroide: X=");
-        Serial.print(blob.centroidX, 2);
-
-        Serial.print(" Y=");
-        Serial.println(blob.centroidY, 2);
-    }
-}
-
-void printTracks() {
-
-    Serial.println();
-    Serial.println("Tracks activos:");
-
-    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
-
-        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
-
-        if (!track.active) {
-            continue;
-        }
-
-        Serial.print("  Track #");
-        Serial.print(track.id);
-
-        Serial.print(" -> X=");
-        Serial.print(track.x, 2);
-
-        Serial.print(" Y=");
-        Serial.print(track.y, 2);
-
-        Serial.print(" counted=");
-        Serial.println(
-            track.alreadyCounted
-                ? "YES"
-                : "NO"
-        );
-    }
-}
-
-// Informa creaciones/bajas de tracks comparando los IDs
-// activos antes y después del frame. Replica los mensajes
-// "NUEVO TRACK" / "FINALIZADO" que antes imprimía la lógica
-// de tracking, sin que PeopleCounter dependa de Serial.
-void printTrackLifecycle(
-    const int idsBefore[PeopleCounter::MAX_TRACKS],
-    int countBefore
-) {
-    // Altas
-    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
-        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
-
-        if (!track.active) {
-            continue;
-        }
-
-        bool known = false;
-        for (int j = 0; j < countBefore; j++) {
-            if (idsBefore[j] == track.id) {
-                known = true;
-                break;
-            }
-        }
-
-        if (!known) {
-            Serial.print("NUEVO TRACK #");
-            Serial.println(track.id);
-        }
+    if (distance < DETECT_MM) {
+      return true;
     }
 
-    // Bajas
-    for (int j = 0; j < countBefore; j++) {
-        bool stillActive = false;
-        for (int i = 0; i < counter.getTrackSlotCount(); i++) {
-            PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
-            if (track.active && track.id == idsBefore[j]) {
-                stillActive = true;
-                break;
-            }
-        }
+  } else {
 
-        if (!stillActive) {
-            Serial.print("TRACK #");
-            Serial.print(idsBefore[j]);
-            Serial.println(" FINALIZADO");
-        }
+    if (distance > RELEASE_MM) {
+      return false;
     }
+  }
+
+  return currentPresence;
 }
 
-void printCrossingEvents() {
-    for (int i = 0; i < counter.getLastEventCount(); i++) {
-        PeopleCounter::CrossingEvent event = counter.getLastEvent(i);
 
-        Serial.println();
-        Serial.print(">>> TRACK #");
-        Serial.print(event.trackId);
-
-        if (event.direction == PeopleCounter::CrossingDirection::In) {
-            Serial.println(" ENTRO <<<");
-        } else if (
-            event.direction == PeopleCounter::CrossingDirection::Out
-        ) {
-            Serial.println(" SALIO <<<");
-        } else {
-            continue;
-        }
-
-        Serial.print("Inside: ");
-        Serial.println(counter.getPeopleInside());
-    }
-}
-
-// ============================================================
-// PROCESAR FRAME
-// ============================================================
-
-void processFrame() {
-
-    generateScenario();
-
-    // Snapshot de tracks activos para el log de altas/bajas.
-    int idsBefore[PeopleCounter::MAX_TRACKS];
-    int countBefore = 0;
-    for (int i = 0; i < counter.getTrackSlotCount(); i++) {
-        PeopleCounter::TrackInfo track = counter.getTrackSlot(i);
-        if (track.active) {
-            idsBefore[countBefore++] = track.id;
-        }
-    }
-
-    counter.processFrame(depthMatrix);
-
-    printOccupancyMatrix();
-
-    printBlobs();
-
-    printTrackLifecycle(idsBefore, countBefore);
-    printCrossingEvents();
-
-    printTracks();
-
-    updateDisplay(counter.getDetectedBlobCount());
-}
-
-// ============================================================
+// ==============================
 // SETUP
-// ============================================================
+// ==============================
 
 void setup() {
 
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    Wire.begin(
-        21,
-        22
-    );
+  delay(1000);
 
-    delay(500);
+  Serial.println();
+  Serial.println("Contador de personas ESP32 + 2x VL53L0X");
 
-    randomSeed(
-        analogRead(0)
-    );
+  pinMode(XSHUT_A, OUTPUT);
+  pinMode(XSHUT_B, OUTPUT);
 
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
+  Wire.begin(SDA_PIN, SCL_PIN);
 
-    Serial.println(
-        " PEOPLE COUNTER - MULTI BLOB"
-    );
+  initSensors();
 
-    Serial.println(
-        "================================"
-    );
-
-    if (
-        !display.begin(
-            SSD1306_SWITCHCAPVCC,
-            OLED_ADDRESS
-        )
-    ) {
-
-        Serial.println(
-            "ERROR OLED"
-        );
-
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    updateDisplay();
-
-    Serial.println(
-        "Sistema iniciado"
-    );
+  Serial.println("Sistema listo.");
 }
 
-// ============================================================
+
+// ==============================
 // LOOP
-// ============================================================
+// ==============================
 
 void loop() {
 
-    if (
-        millis() -
-        lastFrameTime >=
-        FRAME_INTERVAL
-    ) {
+  // Leer sensores
+  uint16_t distanceA = readDistance(sensorA);
+  uint16_t distanceB = readDistance(sensorB);
 
-        lastFrameTime =
-            millis();
+  // Guardamos estado anterior
+  previousA = presenceA;
+  previousB = presenceB;
 
-        processFrame();
+  // Actualizamos presencia
+  presenceA = updatePresence(distanceA, presenceA);
+  presenceB = updatePresence(distanceB, presenceB);
 
-        personAY += personDirection;
+  // Detectar momento exacto en que alguien entra
+  // en la zona de cada sensor
+  bool activatedA = presenceA && !previousA;
+  bool activatedB = presenceB && !previousB;
 
-        // Llegó cerca de la línea, pero NO la cruza.
-        // Se arrepiente y vuelve.
-        if (personAY >= 2) {
-            personDirection = -1;
-        }
 
-        // Cuando vuelve a desaparecer por arriba:
-        if (personAY < -2) {
+  // ==============================
+  // MÁQUINA DE ESTADOS
+  // ==============================
 
-            Serial.println();
-            Serial.println(
-                "===== FIN ESCENARIO SIN CRUCE ====="
-            );
+  switch (state) {
 
-            Serial.print("IN total: ");
-            Serial.println(counter.getTotalIn());
+    // --------------------------
+    // Nadie cruzando
+    // --------------------------
 
-            Serial.print("OUT total: ");
-            Serial.println(counter.getTotalOut());
+    case IDLE:
 
-            Serial.print("Inside: ");
-            Serial.println(counter.getPeopleInside());
+      if (activatedA) {
 
-            delay(3000);
+        state = A_FIRST;
+        sequenceStart = millis();
 
-            personAY = -2;
-            personDirection = 1;
-        }
-    }
+        Serial.println("A detectado primero");
+
+      } else if (activatedB) {
+
+        state = B_FIRST;
+        sequenceStart = millis();
+
+        Serial.println("B detectado primero");
+      }
+
+      break;
+
+
+    // --------------------------
+    // A -> esperando B
+    // --------------------------
+
+    case A_FIRST:
+
+      if (activatedB &&
+          millis() - sequenceStart <= MAX_CROSS_TIME) {
+
+        entradas++;
+
+        Serial.println();
+        Serial.println(">>> ENTRADA <<<");
+
+        Serial.print("Entradas: ");
+        Serial.println(entradas);
+
+        Serial.print("Salidas: ");
+        Serial.println(salidas);
+
+        Serial.print("Personas dentro: ");
+        Serial.println((long)entradas - (long)salidas);
+
+        Serial.println();
+
+        state = WAIT_CLEAR;
+      }
+
+      // Timeout
+      else if (millis() - sequenceStart > MAX_CROSS_TIME) {
+
+        Serial.println("Secuencia A cancelada");
+
+        state = WAIT_CLEAR;
+      }
+
+      break;
+
+
+    // --------------------------
+    // B -> esperando A
+    // --------------------------
+
+    case B_FIRST:
+
+      if (activatedA &&
+          millis() - sequenceStart <= MAX_CROSS_TIME) {
+
+        salidas++;
+
+        Serial.println();
+        Serial.println("<<< SALIDA >>>");
+
+        Serial.print("Entradas: ");
+        Serial.println(entradas);
+
+        Serial.print("Salidas: ");
+        Serial.println(salidas);
+
+        Serial.print("Personas dentro: ");
+        Serial.println((long)entradas - (long)salidas);
+
+        Serial.println();
+
+        state = WAIT_CLEAR;
+      }
+
+      // Timeout
+      else if (millis() - sequenceStart > MAX_CROSS_TIME) {
+
+        Serial.println("Secuencia B cancelada");
+
+        state = WAIT_CLEAR;
+      }
+
+      break;
+
+
+    // --------------------------
+    // Esperamos que la persona
+    // salga de ambos sensores
+    // --------------------------
+
+    case WAIT_CLEAR:
+
+      if (!presenceA && !presenceB) {
+
+        state = IDLE;
+
+        Serial.println("Zona libre");
+      }
+
+      break;
+  }
+
+
+  // ==============================
+  // DEBUG
+  // ==============================
+
+  static unsigned long lastPrint = 0;
+
+  if (millis() - lastPrint > 300) {
+
+    lastPrint = millis();
+
+    Serial.print("A: ");
+    Serial.print(distanceA);
+    Serial.print(" mm ");
+
+    Serial.print(presenceA ? "[OCUPADO]" : "[LIBRE]");
+
+    Serial.print("   |   B: ");
+
+    Serial.print(distanceB);
+    Serial.print(" mm ");
+
+    Serial.println(presenceB ? "[OCUPADO]" : "[LIBRE]");
+  }
 }
