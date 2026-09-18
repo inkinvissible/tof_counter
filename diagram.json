@@ -6,17 +6,113 @@
     {
       "type": "wokwi-esp32-devkit-v1",
       "id": "esp",
-      "top": 0,
-      "left": 0,
+      "top": 110,
+      "left": 250,
       "attrs": {}
     },
     {
       "type": "board-ssd1306",
       "id": "oled",
-      "top": 50,
-      "left": 300,
+      "top": 430,
+      "left": 270,
       "attrs": {
         "i2cAddress": "0x3c"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "title",
+      "top": -20,
+      "left": 120,
+      "attrs": {
+        "text": "Contador de personas - ESP32 + 2x ToF VL53L0X"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "labelA",
+      "top": 60,
+      "left": 10,
+      "attrs": {
+        "text": "VL53L0X A (0x30)\nSIM = boton verde\nTecla A"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnA",
+      "top": 150,
+      "left": 40,
+      "attrs": {
+        "color": "green",
+        "label": "Sensor A",
+        "key": "a",
+        "bounce": "0"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledA",
+      "top": 270,
+      "left": 70,
+      "attrs": {
+        "color": "green"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "rA",
+      "top": 320,
+      "left": 70,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "labelB",
+      "top": 60,
+      "left": 460,
+      "attrs": {
+        "text": "VL53L0X B (0x31)\nSIM = boton azul\nTecla B"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnB",
+      "top": 150,
+      "left": 480,
+      "attrs": {
+        "color": "blue",
+        "label": "Sensor B",
+        "key": "b",
+        "bounce": "0"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledB",
+      "top": 270,
+      "left": 510,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "rB",
+      "top": 320,
+      "left": 510,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "help",
+      "top": 430,
+      "left": 10,
+      "attrs": {
+        "text": "A luego B = ENTRADA\nB luego A = SALIDA\nLED = OCUPADO"
       }
     }
   ],
@@ -24,11 +120,24 @@
     ["esp:TX0", "$serialMonitor:RX", "", []],
     ["esp:RX0", "$serialMonitor:TX", "", []],
 
-    ["esp:D21", "oled:SDA", "green", ["h40", "v-80", "*", "v-30"]],
-    ["esp:D22", "oled:SCL", "blue", ["h60", "v-100", "*", "v-50"]],
+    ["esp:D21", "oled:SDA", "green", ["h0"]],
+    ["esp:D22", "oled:SCL", "blue", ["h0"]],
+    ["esp:3V3", "oled:VCC", "red", ["h0"]],
+    ["esp:GND.1", "oled:GND", "black", ["h0"]],
 
-    ["esp:3V3", "oled:VCC", "red", ["h40", "v-80", "*", "v-30"]],
-    ["esp:GND.1", "oled:GND", "black", ["h40", "v-80", "*", "v-30"]]
+    ["btnA:1.l", "esp:D32", "green", ["h0"]],
+    ["btnA:2.l", "esp:GND.2", "black", ["h0"]],
+
+    ["btnB:1.l", "esp:D33", "green", ["h0"]],
+    ["btnB:2.l", "esp:GND.2", "black", ["h0"]],
+
+    ["esp:D25", "ledA:A", "orange", ["h0"]],
+    ["ledA:C", "rA:1", "orange", ["h0"]],
+    ["rA:2", "esp:GND.2", "black", ["h0"]],
+
+    ["esp:D26", "ledB:A", "orange", ["h0"]],
+    ["ledB:C", "rB:1", "orange", ["h0"]],
+    ["rB:2", "esp:GND.2", "black", ["h0"]]
   ],
   "serialMonitor": {
     "display": "always",
