@@ -75,6 +75,13 @@ const uint16_t RELEASE_MM = 1500;
 // Tiempo máximo entre sensor A y sensor B
 const unsigned long MAX_CROSS_TIME = 1500;
 
+#ifndef WOKWI_SIM
+// Si un sensor estaba ocupado y queda fuera de rango, exigimos
+// varias lecturas consecutivas antes de liberarlo. Así evitamos
+// que una lectura inválida aislada genere una falsa liberación.
+const uint8_t INVALID_READINGS_TO_CLEAR = 3;
+#endif
+
 #ifdef WOKWI_SIM
 // Distancias ficticias solo para que el log Serial de Wokwi
 // tenga el mismo formato que el hardware real.
@@ -102,6 +109,11 @@ bool presenceB = false;
 
 bool previousA = false;
 bool previousB = false;
+
+#ifndef WOKWI_SIM
+uint8_t invalidReadingsA = 0;
+uint8_t invalidReadingsB = 0;
+#endif
 
 unsigned long sequenceStart = 0;
 
@@ -187,12 +199,33 @@ uint16_t readDistance(Adafruit_VL53L0X &sensor) {
 // CON HISTÉRESIS
 // ==============================
 
-bool updatePresence(uint16_t distance, bool currentPresence) {
+bool updatePresence(uint16_t distance,
+                    bool currentPresence,
+                    uint8_t &invalidReadings) {
 
-  // Si la lectura fue inválida, mantenemos el estado anterior.
+  // Una lectura fuera de rango aislada no debe cambiar el estado.
+  // Si el sensor estaba ocupado y la condición se repite varias
+  // veces, interpretamos que la persona ya abandonó la zona.
   if (distance == 8190) {
-    return currentPresence;
+
+    if (!currentPresence) {
+      invalidReadings = 0;
+      return false;
+    }
+
+    if (invalidReadings < INVALID_READINGS_TO_CLEAR) {
+      invalidReadings++;
+    }
+
+    if (invalidReadings >= INVALID_READINGS_TO_CLEAR) {
+      invalidReadings = 0;
+      return false;
+    }
+
+    return true;
   }
+
+  invalidReadings = 0;
 
   if (!currentPresence) {
 
@@ -325,8 +358,8 @@ void loop() {
   previousB = presenceB;
 
   // Actualizamos presencia
-  presenceA = updatePresence(distanceA, presenceA);
-  presenceB = updatePresence(distanceB, presenceB);
+  presenceA = updatePresence(distanceA, presenceA, invalidReadingsA);
+  presenceB = updatePresence(distanceB, presenceB, invalidReadingsB);
 
   // Detectar momento exacto en que alguien entra
   // en la zona de cada sensor
